@@ -1,0 +1,30 @@
+name: Build mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # Supplies the Stardew Valley / SMAPI reference assemblies, so no game files are needed.
+      - uses: Pathoschild/SMAPI-ModBuildWorkflow/add-build-environment@v1
+
+      - name: Build
+        run: dotnet build NpcAdExporter.csproj -c Release -p:EnableModDeploy=false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NpcAdExporter
+          if-no-files-found: error
+          path: |
+            bin/Release/net6.0/*.zip
+            bin/Release/net6.0/NpcAdExporter.dll
+            bin/Release/net6.0/manifest.json

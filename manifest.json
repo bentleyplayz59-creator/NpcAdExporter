@@ -1,0 +1,12 @@
+{
+  "Name": "NPC Ad Exporter",
+  "Author": "BentleyPlayz",
+  "Version": "1.0.0",
+  "Description": "On save load, runs Content Patcher 'patch export' for the shopkeeper interiors, tilesheets, portraits and sprites needed to build NPC ads.",
+  "UniqueID": "BentleyPlayz.NpcAdExporter",
+  "EntryDll": "NpcAdExporter.dll",
+  "MinimumApiVersion": "4.0.0",
+  "Dependencies": [
+    { "UniqueID": "Pathoschild.ContentPatcher", "IsRequired": true }
+  ]
+}
