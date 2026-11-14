@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
@@ -10,7 +12,7 @@ using xTile.Tiles;
 
 namespace NpcAdExporter;
 
-/// <summary>On save load, runs Content Patcher's "patch export" for everything needed to build NPC shop ads.</summary>
+/// <summary>On save load, exports everything needed to build NPC shop ads (no other mods required).</summary>
 public class ModEntry : Mod
 {
     /*********
@@ -44,6 +46,14 @@ public class ModEntry : Mod
     ** Fields
     *********/
     private bool Done;
+
+    /// <summary>Pixels of a tilesheet, cached while rendering maps.</summary>
+    private class SheetData
+    {
+        public Color[] Pixels;
+        public int Width;
+        public int Height;
+    }
 
     /*********
     ** Public methods
@@ -100,8 +110,7 @@ public class ModEntry : Mod
 
         this.Monitor.Log(
             $"Done. Maps: {mapsOk} ok, {mapsFailed} failed. Images: {imagesOk} ok, {imagesFailed} failed. " +
-            "Content Patcher files are in the 'patch export' folder in your game folder; " +
-            $"map layout JSON is in '{this.Helper.DirectoryPath}/export'.",
+            $"Files are in: {Path.Combine(this.Helper.DirectoryPath, "export")}",
             LogLevel.Alert
         );
     }
@@ -111,7 +120,6 @@ public class ModEntry : Mod
         Map map;
         try
         {
-            // loading it first means Content Patcher can detect the asset type
             map = this.Helper.GameContent.Load<Map>(assetName);
         }
         catch (Exception ex)
@@ -127,48 +135,163 @@ public class ModEntry : Mod
                 images.Add(this.NormalizeSheetPath(sheet.ImageSource));
         }
 
-        // Content Patcher export
-        bool exported = this.RunPatchExport(assetName, null);
-
-        // fallback: our own dump of the map layout, in case the map doesn't export as a usable file
+        // layout JSON (backup, lets us rebuild the map from data)
         this.DumpMapLayout(assetName, map);
 
-        return exported;
+        // full rendered picture of the map
+        return this.RenderMap(assetName, map);
     }
 
     private bool ExportImage(string assetName)
     {
         try
         {
-            this.Helper.GameContent.Load<Texture2D>(assetName);
+            Texture2D texture = this.Helper.GameContent.Load<Texture2D>(assetName);
+            string path = this.GetOutputPath(assetName, ".png");
+            using (FileStream stream = File.Create(path))
+                texture.SaveAsPng(stream, texture.Width, texture.Height);
+            return true;
         }
         catch (Exception ex)
         {
-            this.Monitor.Log($"Couldn't load image '{assetName}': {ex.Message}", LogLevel.Warn);
+            this.Monitor.Log($"Couldn't export image '{assetName}': {ex.Message}", LogLevel.Warn);
             return false;
         }
-
-        return this.RunPatchExport(assetName, "image");
     }
 
-    private bool RunPatchExport(string assetName, string type)
+    /// <summary>Draw every visible layer of the map into one PNG.</summary>
+    private bool RenderMap(string assetName, Map map)
     {
-        string[] args = type == null
-            ? new[] { "export", assetName }
-            : new[] { "export", assetName, type };
-
         try
         {
-            bool found = this.Helper.ConsoleCommands.Trigger("patch", args);
-            if (!found)
-                this.Monitor.Log($"'patch' command not found (is Content Patcher installed?) for '{assetName}'.", LogLevel.Error);
-            return found;
+            const int TileSize = 16;
+
+            int widthTiles = 0, heightTiles = 0;
+            foreach (Layer layer in map.Layers)
+            {
+                widthTiles = Math.Max(widthTiles, layer.LayerWidth);
+                heightTiles = Math.Max(heightTiles, layer.LayerHeight);
+            }
+
+            int width = widthTiles * TileSize;
+            int height = heightTiles * TileSize;
+            if (width <= 0 || height <= 0)
+                return false;
+
+            var canvas = new Color[width * height];
+            var sheets = new Dictionary<string, SheetData>();
+
+            foreach (Layer layer in map.Layers)
+            {
+                // the Paths layer is a marker layer, not drawn in-game
+                if (string.Equals(layer.Id, "Paths", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                for (int y = 0; y < layer.LayerHeight; y++)
+                {
+                    for (int x = 0; x < layer.LayerWidth; x++)
+                    {
+                        Tile tile = layer.Tiles[x, y];
+                        if (tile == null || tile.TileSheet == null)
+                            continue;
+
+                        SheetData sheet = this.GetSheetData(tile.TileSheet, sheets);
+                        if (sheet == null)
+                            continue;
+
+                        int columns = sheet.Width / TileSize;
+                        if (columns <= 0)
+                            continue;
+
+                        int srcX0 = (tile.TileIndex % columns) * TileSize;
+                        int srcY0 = (tile.TileIndex / columns) * TileSize;
+
+                        for (int py = 0; py < TileSize; py++)
+                        {
+                            int srcY = srcY0 + py;
+                            if (srcY >= sheet.Height)
+                                break;
+
+                            for (int px = 0; px < TileSize; px++)
+                            {
+                                int srcX = srcX0 + px;
+                                if (srcX >= sheet.Width)
+                                    break;
+
+                                Color src = sheet.Pixels[srcY * sheet.Width + srcX];
+                                if (src.A == 0)
+                                    continue;
+
+                                int dstIndex = (y * TileSize + py) * width + (x * TileSize + px);
+                                if (src.A == 255)
+                                {
+                                    canvas[dstIndex] = src;
+                                    continue;
+                                }
+
+                                // pixels from the game are premultiplied, so blend "over"
+                                Color dst = canvas[dstIndex];
+                                int inv = 255 - src.A;
+                                canvas[dstIndex] = new Color(
+                                    Math.Min(255, src.R + dst.R * inv / 255),
+                                    Math.Min(255, src.G + dst.G * inv / 255),
+                                    Math.Min(255, src.B + dst.B * inv / 255),
+                                    Math.Min(255, src.A + dst.A * inv / 255)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            using (var texture = new Texture2D(StardewValley.Game1.graphics.GraphicsDevice, width, height))
+            {
+                texture.SetData(canvas);
+                string path = this.GetOutputPath(assetName, ".rendered.png");
+                using (FileStream stream = File.Create(path))
+                    texture.SaveAsPng(stream, width, height);
+            }
+
+            return true;
         }
         catch (Exception ex)
         {
-            this.Monitor.Log($"patch export failed for '{assetName}': {ex.Message}", LogLevel.Error);
+            this.Monitor.Log($"Couldn't render map '{assetName}': {ex.Message}", LogLevel.Error);
             return false;
         }
+    }
+
+    private SheetData GetSheetData(TileSheet sheet, Dictionary<string, SheetData> cache)
+    {
+        if (cache.TryGetValue(sheet.Id, out SheetData cached))
+            return cached;
+
+        SheetData data = null;
+        try
+        {
+            Texture2D texture = this.Helper.GameContent.Load<Texture2D>(this.NormalizeSheetPath(sheet.ImageSource));
+            var pixels = new Color[texture.Width * texture.Height];
+            texture.GetData(pixels);
+            data = new SheetData { Pixels = pixels, Width = texture.Width, Height = texture.Height };
+        }
+        catch (Exception ex)
+        {
+            this.Monitor.Log($"Couldn't read tilesheet '{sheet.ImageSource}': {ex.Message}", LogLevel.Warn);
+        }
+
+        cache[sheet.Id] = data;
+        return data;
+    }
+
+    /// <summary>Get the output file path for an asset (creating its folder).</summary>
+    private string GetOutputPath(string assetName, string extension)
+    {
+        string relative = assetName.Replace('\\', '/').Replace('/', Path.DirectorySeparatorChar);
+        string fullPath = Path.Combine(this.Helper.DirectoryPath, "export", relative + extension);
+        string folder = Path.GetDirectoryName(fullPath);
+        if (folder != null)
+            Directory.CreateDirectory(folder);
+        return fullPath;
     }
 
     /// <summary>Turn a tilesheet's image source into an asset name like 'Maps/townInterior'.</summary>
