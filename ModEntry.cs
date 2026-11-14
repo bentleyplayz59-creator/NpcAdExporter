@@ -9,10 +9,11 @@ using StardewModdingAPI.Events;
 using xTile;
 using xTile.Layers;
 using xTile.Tiles;
+using Game1 = StardewValley.Game1;
 
 namespace NpcAdExporter;
 
-/// <summary>On save load, exports everything needed to build NPC shop ads (no other mods required).</summary>
+/// <summary>Exports everything needed to build NPC shop ads. Runs once when a world loads, and any time you tap the on-screen button.</summary>
 public class ModEntry : Mod
 {
     /*********
@@ -45,7 +46,14 @@ public class ModEntry : Mod
     /*********
     ** Fields
     *********/
-    private bool Done;
+    private bool AutoRan;
+    private bool Running;
+    private string Status = "Export Ad Assets";
+
+    private Queue<string> MapQueue;
+    private Queue<string> ImageQueue;
+    private HashSet<string> Images;
+    private int Ok, Failed, MapsTotal, MapsDone, ImagesTotal, ImagesDone, LastReported;
 
     /// <summary>Pixels of a tilesheet, cached while rendering maps.</summary>
     private class SheetData
@@ -60,59 +68,215 @@ public class ModEntry : Mod
     *********/
     public override void Entry(IModHelper helper)
     {
-        helper.Events.GameLoop.SaveLoaded += this.OnSaveLoaded;
+        helper.Events.GameLoop.DayStarted += this.OnDayStarted;
+        helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
+        helper.Events.Display.RenderedHud += this.OnRenderedHud;
+        helper.Events.Input.ButtonPressed += this.OnButtonPressed;
+
+        helper.ConsoleCommands.Add("exportads", "Runs the NPC ad asset export.", (name, args) =>
+            this.StartExport());
+
+        this.Monitor.Log(
+            $"Ready. Nothing runs until you load a world. Output folder: {this.GetExportFolder()}",
+            LogLevel.Alert
+        );
+    }
+
+    /*********
+    ** Event handlers
+    *********/
+    /// <summary>Runs the export once automatically, the first time a world starts.</summary>
+    private void OnDayStarted(object sender, DayStartedEventArgs e)
+    {
+        if (this.AutoRan)
+            return;
+        this.AutoRan = true;
+
+        this.StartExport();
+    }
+
+    /// <summary>Does a little of the export work each tick, so progress shows up on screen while it runs.</summary>
+    private void OnUpdateTicked(object sender, UpdateTickedEventArgs e)
+    {
+        if (!this.Running)
+            return;
+
+        if (!Context.IsWorldReady)
+        {
+            this.Running = false;
+            this.Status = "Export stopped (left world)";
+            return;
+        }
+
+        // stage 1: maps (one per tick)
+        if (this.MapQueue.Count > 0)
+        {
+            string name = this.MapQueue.Dequeue();
+            bool good = this.ExportMap(name, this.Images);
+            this.MapsDone++;
+            if (good)
+                this.Ok++;
+            else
+                this.Failed++;
+
+            this.Status = $"Exporting maps {this.MapsDone}/{this.MapsTotal}";
+            this.Say($"{(good ? "OK" : "FAILED")}: {name}", !good);
+            return;
+        }
+
+        // stage 2: images (a few per tick)
+        if (this.ImageQueue == null)
+        {
+            this.ImageQueue = new Queue<string>(this.Images.OrderBy(p => p, StringComparer.OrdinalIgnoreCase));
+            this.ImagesTotal = this.ImageQueue.Count;
+            this.Say($"Maps done. Exporting {this.ImagesTotal} images (portraits, sprites, tilesheets, item sheets)...");
+            return;
+        }
+
+        if (this.ImageQueue.Count > 0)
+        {
+            for (int i = 0; i < 3 && this.ImageQueue.Count > 0; i++)
+            {
+                string name = this.ImageQueue.Dequeue();
+                bool good = this.ExportImage(name);
+                this.ImagesDone++;
+                if (good)
+                    this.Ok++;
+                else
+                {
+                    this.Failed++;
+                    this.Say($"FAILED: {name}", true);
+                }
+            }
+
+            this.Status = $"Exporting images {this.ImagesDone}/{this.ImagesTotal}";
+            if (this.ImagesDone - this.LastReported >= 15)
+            {
+                this.LastReported = this.ImagesDone;
+                this.Say($"Images: {this.ImagesDone}/{this.ImagesTotal}");
+            }
+            return;
+        }
+
+        // finished
+        this.Running = false;
+        this.Status = $"Done: {this.Ok} ok, {this.Failed} failed. Tap to rerun";
+        this.Say($"DONE. {this.Ok} exported, {this.Failed} failed. Files are in: {this.GetExportFolder()}");
+    }
+
+    /// <summary>Draws the on-screen button.</summary>
+    private void OnRenderedHud(object sender, RenderedHudEventArgs e)
+    {
+        if (!this.IsButtonVisible())
+            return;
+
+        Rectangle rect = this.GetButtonRect();
+        SpriteBatch batch = e.SpriteBatch;
+        Color fill = this.Running ? new Color(130, 85, 0) : new Color(20, 95, 45);
+
+        batch.Draw(Game1.staminaRect, new Rectangle(rect.X - 4, rect.Y - 4, rect.Width + 8, rect.Height + 8), Color.White);
+        batch.Draw(Game1.staminaRect, rect, fill * 0.92f);
+
+        Vector2 size = Game1.smallFont.MeasureString(this.Status);
+        batch.DrawString(
+            Game1.smallFont,
+            this.Status,
+            new Vector2(rect.X + (rect.Width - size.X) / 2f, rect.Y + (rect.Height - size.Y) / 2f),
+            Color.White
+        );
+    }
+
+    /// <summary>Starts the export when the on-screen button is tapped.</summary>
+    private void OnButtonPressed(object sender, ButtonPressedEventArgs e)
+    {
+        if (e.Button != SButton.MouseLeft || !this.IsButtonVisible())
+            return;
+
+        int mouseX = Game1.getMouseX(true);
+        int mouseY = Game1.getMouseY(true);
+        if (this.GetButtonRect().Contains(mouseX, mouseY))
+        {
+            this.Helper.Input.Suppress(e.Button);
+            this.StartExport();
+        }
     }
 
     /*********
     ** Private methods
     *********/
-    private void OnSaveLoaded(object sender, SaveLoadedEventArgs e)
+    private bool IsButtonVisible()
     {
-        if (this.Done)
-            return;
-        this.Done = true;
-
-        this.ExportAll();
+        return Context.IsWorldReady && Game1.activeClickableMenu == null && !Game1.eventUp;
     }
 
-    private void ExportAll()
+    private Rectangle GetButtonRect()
     {
-        // image assets to export (tilesheets get added as maps are processed)
-        var images = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Vector2 size = Game1.smallFont.MeasureString(this.Status);
+        int width = Math.Max(260, (int)size.X + 40);
+        int height = 72;
+        return new Rectangle(16, Game1.uiViewport.Height / 3, width, height);
+    }
+
+    private string GetExportFolder()
+    {
+        return Path.Combine(this.Helper.DirectoryPath, "export");
+    }
+
+    /// <summary>Show a message in the in-game chat (and the SMAPI log).</summary>
+    private void Say(string text, bool isError = false)
+    {
+        this.Monitor.Log(text, isError ? LogLevel.Warn : LogLevel.Info);
+
+        try
+        {
+            if (Game1.chatBox != null)
+                Game1.chatBox.addInfoMessage("[Ad Exporter] " + text);
+        }
+        catch (Exception)
+        {
+            // chat isn't critical
+        }
+    }
+
+    private void StartExport()
+    {
+        if (!Context.IsWorldReady)
+        {
+            this.Monitor.Log("Load a world first, then try again.", LogLevel.Warn);
+            return;
+        }
+
+        if (this.Running)
+        {
+            this.Say("Export is already running...");
+            return;
+        }
+
+        this.Images = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (string npc in Npcs)
         {
-            images.Add($"Portraits/{npc}");
-            images.Add($"Characters/{npc}");
+            this.Images.Add($"Portraits/{npc}");
+            this.Images.Add($"Characters/{npc}");
         }
         foreach (string name in SharedImages)
-            images.Add(name);
+            this.Images.Add(name);
 
-        // maps
         IEnumerable<string> maps = IncludeExteriors ? InteriorMaps.Concat(ExteriorMaps) : InteriorMaps;
-        int mapsOk = 0, mapsFailed = 0;
-        foreach (string mapName in maps)
-        {
-            if (this.ExportMap(mapName, images))
-                mapsOk++;
-            else
-                mapsFailed++;
-        }
+        this.MapQueue = new Queue<string>(maps);
+        this.ImageQueue = null;
+        this.MapsTotal = this.MapQueue.Count;
+        this.MapsDone = 0;
+        this.ImagesTotal = 0;
+        this.ImagesDone = 0;
+        this.LastReported = 0;
+        this.Ok = 0;
+        this.Failed = 0;
 
-        // images (portraits, sprites, shared sheets, and every tilesheet the maps use)
-        int imagesOk = 0, imagesFailed = 0;
-        foreach (string imageName in images.OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
-        {
-            if (this.ExportImage(imageName))
-                imagesOk++;
-            else
-                imagesFailed++;
-        }
+        Directory.CreateDirectory(this.GetExportFolder());
 
-        this.Monitor.Log(
-            $"Done. Maps: {mapsOk} ok, {mapsFailed} failed. Images: {imagesOk} ok, {imagesFailed} failed. " +
-            $"Files are in: {Path.Combine(this.Helper.DirectoryPath, "export")}",
-            LogLevel.Alert
-        );
+        this.Running = true;
+        this.Status = "Exporting...";
+        this.Say($"Export started: {this.MapsTotal} maps, then images. Folder: {this.GetExportFolder()}");
     }
 
     private bool ExportMap(string assetName, HashSet<string> images)

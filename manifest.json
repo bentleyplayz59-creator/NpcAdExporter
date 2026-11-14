@@ -1,8 +1,8 @@
 {
   "Name": "NPC Ad Exporter",
   "Author": "BentleyPlayz",
-  "Version": "1.0.1",
-  "Description": "On save load, exports shopkeeper interiors/exteriors (rendered PNG + layout JSON), tilesheets, portraits and sprites needed to build NPC ads.",
+  "Version": "1.1.0",
+  "Description": "Exports shopkeeper interiors/exteriors (rendered PNG + layout JSON), tilesheets, portraits and sprites needed to build NPC ads. Runs once on world load; tap the on-screen button to run it again. Progress shows in chat.",
   "UniqueID": "BentleyPlayz.NpcAdExporter",
   "EntryDll": "NpcAdExporter.dll",
   "MinimumApiVersion": "4.0.0"
